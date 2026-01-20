@@ -11,18 +11,21 @@ if(NOT DEFINED NRFX_DIR)
   set(NRFX_DIR ${ZEPHYR_CURRENT_MODULE_DIR}/nrfx CACHE PATH "nrfx Directory")
 endif()
 
-if(NOT DEFINED CONFIG_SOC_NORDIC_BSP_NAME)
-  message(FATAL_ERROR "CONFIG_SOC_NORDIC_BSP_NAME has to be defined.")
-endif()
-
 set(INC_DIR ${NRFX_DIR}/drivers/include)
 set(SRC_DIR ${NRFX_DIR}/drivers/src)
 set(HELPERS_DIR ${NRFX_DIR}/helpers)
 
+if(NOT DEFINED CONFIG_SOC_NORDIC_BSP_NAME)
+  message(FATAL_ERROR "CONFIG_SOC_NORDIC_BSP_NAME has to be defined.")
+endif()
+
 if(DEFINED CONFIG_SOC_NORDIC_BSP_PATH_OVERRIDE)
   set(BSP_DIR ${ZEPHYR_CURRENT_MODULE_DIR}/${CONFIG_SOC_NORDIC_BSP_PATH_OVERRIDE}/${CONFIG_SOC_NORDIC_BSP_NAME})
 else()
-  set(BSP_DIR ${NRFX_DIR}/bsp/${CONFIG_SOC_NORDIC_BSP_NAME})
+  # convert the SOC_NORDIC_BSP_NAME to upper case and replace '-' with '_'
+  string(TOUPPER ${CONFIG_SOC_NORDIC_BSP_NAME} SOC_NORDIC_BSP_NAME_UPPER)
+  string(REPLACE "-" "_" SOC_NORDIC_BSP_NAME_UPPER ${SOC_NORDIC_BSP_NAME_UPPER})
+  set(BSP_DIR ${ZEPHYR_${SOC_NORDIC_BSP_NAME_UPPER}_MODULE_DIR})
 endif()
 
 set(MDK_DIR ${BSP_DIR}/mdk)
@@ -76,13 +79,6 @@ zephyr_compile_definitions_ifdef(CONFIG_SOC_COMPATIBLE_NRF54LM20A_CPUAPP NRF_APP
 zephyr_compile_definitions_ifdef(CONFIG_SOC_NRF9120             NRF9120_XXAA)
 zephyr_compile_definitions_ifdef(CONFIG_SOC_NRF9160             NRF9160_XXAA)
 
-zephyr_compile_definitions_ifdef(CONFIG_SOC_NRF9230_ENGB_CPUAPP NRF9230_ENGB_XXAA
-                                                                NRF_APPLICATION)
-zephyr_compile_definitions_ifdef(CONFIG_SOC_NRF9230_ENGB_CPURAD NRF9230_ENGB_XXAA
-                                                                NRF_RADIOCORE)
-zephyr_compile_definitions_ifdef(CONFIG_SOC_NRF9230_ENGB_CPUPPR NRF9230_ENGB_XXAA
-                                                                NRF_PPR)
-
 zephyr_compile_definitions_ifdef(CONFIG_NRF_APPROTECT_LOCK
                                  ENABLE_APPROTECT)
 zephyr_compile_definitions_ifdef(CONFIG_NRF_APPROTECT_USER_HANDLING
@@ -121,7 +117,6 @@ if(CONFIG_SOC_SERIES_NRF54LX OR CONFIG_SOC_SERIES_BSIM_NRF54LX)
   zephyr_library_sources(${MDK_DIR}/system_nrf54l.c)
 endif()
 zephyr_library_sources_ifdef(CONFIG_SOC_SERIES_NRF91X  ${MDK_DIR}/system_nrf91.c)
-zephyr_library_sources_ifdef(CONFIG_SOC_SERIES_NRF92X  ${MDK_DIR}/system_nrf92.c)
 
 zephyr_library_sources(nrfx_glue.c)
 zephyr_library_sources(${HELPERS_DIR}/nrfx_flag32_allocator.c)
@@ -266,7 +261,4 @@ mdk_svd_ifdef(CONFIG_SOC_NRF54LM20A_ENGA_CPUAPP nrf54lm20a_enga_application.svd)
 mdk_svd_ifdef(CONFIG_SOC_NRF54LM20A_ENGA_CPUFLPR nrf54lm20a_enga_flpr.svd)
 mdk_svd_ifdef(CONFIG_SOC_NRF9120              nrf9120.svd)
 mdk_svd_ifdef(CONFIG_SOC_NRF9160              nrf9160.svd)
-mdk_svd_ifdef(CONFIG_SOC_NRF9230_ENGB_CPUAPP  nrf9230_engb_application.svd)
-mdk_svd_ifdef(CONFIG_SOC_NRF9230_ENGB_CPUPPR  nrf9230_engb_ppr.svd)
-mdk_svd_ifdef(CONFIG_SOC_NRF9230_ENGB_CPURAD  nrf9230_engb_radiocore.svd)
 build_info(vendor-specific nordic svdfile VALUE ${SOC_SVD_FILE})
