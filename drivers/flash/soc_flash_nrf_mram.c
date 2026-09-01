@@ -46,6 +46,109 @@ struct nrf_mram_data_t {
 	struct k_mutex nrf_mram_mutex;
 };
 
+#if defined(CONFIG_NRF_MRAM_USE_MUTEX_HW) && DT_INST_NODE_HAS_PROP(0, nordic_mutexes)
+
+/* Maps an MRAM bank address range to the hardware mutex that serializes it. */
+struct mram_bank_mutex {
+	uint32_t start;
+	uint32_t end;
+	NRF_MUTEX_Type *reg;
+	uint8_t index;
+};
+
+/* One mutex specifier per bank; each bank selects its mutex via its
+ * "nordic,mutex-index" into the controller's "nordic,mutexes" list. Only
+ * "nordic,mram-bank" children that define "nordic,mutex-index" are mapped;
+ * banks without it (and the partitions child) are left unlocked.
+ */
+#define MRAM_BANK_MUTEX_ENTRY(node_id)                                                             \
+	COND_CODE_1(UTIL_AND(DT_NODE_HAS_COMPAT(node_id, nordic_mram_bank),                         \
+			     DT_NODE_HAS_PROP(node_id, nordic_mutex_index)),                        \
+		    ({                                                                             \
+			     .start = DT_REG_ADDR(node_id),                                        \
+			     .end = DT_REG_ADDR(node_id) + DT_REG_SIZE(node_id),                   \
+			     .reg = (NRF_MUTEX_Type *)DT_REG_ADDR(DT_INST_PHANDLE_BY_IDX(          \
+				     0, nordic_mutexes, DT_PROP(node_id, nordic_mutex_index))),    \
+			     .index = DT_INST_PHA_BY_IDX(0, nordic_mutexes,                        \
+							 DT_PROP(node_id, nordic_mutex_index),         \
+							 index),                                       \
+		     },),                                                                          \
+		    ())
+
+static const struct mram_bank_mutex mram_bank_mutexes[] = {
+	DT_FOREACH_CHILD(MRAM_NVM_CHILD_NODE, MRAM_BANK_MUTEX_ENTRY)
+};
+
+BUILD_ASSERT(ARRAY_SIZE(mram_bank_mutexes) == DT_INST_PROP_LEN(0, nordic_mutexes),
+	     "nordic,mram: each listed mutex must be claimed by exactly one mram bank");
+
+/* Verify that each claimed mutex index is within its MUTEX instance's range. */
+#define MRAM_MUTEX_RANGE_ASSERT(node_id, prop, idx)                                                \
+	BUILD_ASSERT(DT_PHA_BY_IDX(node_id, prop, idx, index) <                                     \
+			     DT_PROP(DT_PHANDLE_BY_IDX(node_id, prop, idx), nordic_mutex_count),    \
+		     "nordic,mram: claimed mutex index is out of range for the MUTEX instance");
+
+DT_INST_FOREACH_PROP_ELEM(0, nordic_mutexes, MRAM_MUTEX_RANGE_ASSERT)
+
+static inline bool hw_mutex_lock(NRF_MUTEX_Type *p_reg, uint8_t mutex)
+{
+	return (p_reg->MUTEX[mutex] == MUTEX_MUTEX_MUTEX_Unlocked);
+}
+
+static inline void hw_mutex_unlock(NRF_MUTEX_Type *p_reg, uint8_t mutex)
+{
+	p_reg->MUTEX[mutex] = MUTEX_MUTEX_MUTEX_Unlocked;
+}
+
+static const struct mram_bank_mutex *nrf_mram_bank_mutex(uint32_t addr)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(mram_bank_mutexes); i++) {
+		if (addr >= mram_bank_mutexes[i].start && addr < mram_bank_mutexes[i].end) {
+			return &mram_bank_mutexes[i];
+		}
+	}
+
+	return NULL;
+}
+
+static inline void nrf_mram_hw_lock(uint32_t addr)
+{
+	const struct mram_bank_mutex *bank = nrf_mram_bank_mutex(addr);
+
+	if (bank == NULL) {
+		return;
+	}
+
+	while (!hw_mutex_lock(bank->reg, bank->index)) {
+		/* Spin until the hardware mutex is acquired by this domain */
+	}
+}
+
+static inline void nrf_mram_hw_unlock(uint32_t addr)
+{
+	const struct mram_bank_mutex *bank = nrf_mram_bank_mutex(addr);
+
+	if (bank == NULL) {
+		return;
+	}
+
+	hw_mutex_unlock(bank->reg, bank->index);
+}
+
+#else
+
+static inline void nrf_mram_hw_lock(uint32_t addr)
+{
+	ARG_UNUSED(addr);
+}
+
+static inline void nrf_mram_hw_unlock(uint32_t addr)
+{
+	ARG_UNUSED(addr);
+}
+
+#endif /* CONFIG_NRF_MRAM_USE_MUTEX_HW && DT_INST_NODE_HAS_PROP(0, nordic_mutexes) */
+
 /**
  * Safely probes one MRAM word to detect a BusFault.
  *
@@ -59,6 +162,7 @@ struct nrf_mram_data_t {
  * @retval 0 Read completed without BusFault.
  * @retval non-zero BusFault was observed during the read.
  */
+#if defined(CONFIG_CPU_CORTEX_M)
 static uint32_t nrf_mram_detect_corrupt_word(uint32_t addr)
 {
 	uint32_t rdata;
@@ -97,7 +201,7 @@ static uint32_t nrf_mram_detect_corrupt_word(uint32_t addr)
 
 	return faulted;    /* 0 = read succeeded, non-zero = bus fault occurred */
 }
-
+#endif /* CONFIG_CPU_CORTEX_M */
 
 /**
  * Write data to an aligned MRAM word and verify the write succeeded.
@@ -129,10 +233,17 @@ static int nrf_mram_write_and_verify_word(uint32_t addr, const void *data, size_
 			memcpy((void *)addr, data, len);
 		}
 
+#if defined(CONFIG_CPU_CORTEX_M)
 		if (!nrf_mram_detect_corrupt_word(addr)) {
 			return 0;
 		}
-		LOG_ERR("MRAM write verification failed at address 0x%x, retrying... (%u retries "
+#else
+		/* VPR (RISC-V) has no BusFault probe; verify by reading back. */
+		if (memcmp((const void *)addr, data, len) == 0) {
+			return 0;
+		}
+#endif
+		printk("MRAM write verification failed at address 0x%x, retrying... (%u retries "
 			"left)",
 			addr, retries);
 	}
@@ -197,9 +308,24 @@ static int nrf_mram_erase_and_verify_word(uint32_t addr, size_t len)
 		for (size_t i = 0; i < len / 4; i++) {
 			((uint32_t *)addr)[i] = 0xffffffffU;
 		}
+#if defined(CONFIG_CPU_CORTEX_M)
 		if (!nrf_mram_detect_corrupt_word(addr)) {
 			return 0;
 		}
+#else
+		/* VPR (RISC-V) has no BusFault probe; verify the erased pattern. */
+		bool erased = true;
+
+		for (size_t i = 0; i < len / 4; i++) {
+			if (((volatile uint32_t *)addr)[i] != 0xffffffffU) {
+				erased = false;
+				break;
+			}
+		}
+		if (erased) {
+			return 0;
+		}
+#endif
 		LOG_ERR("MRAM erase verification failed at address 0x%x, retrying... (%u retries "
 			"left)",
 			addr, retries);
@@ -243,13 +369,9 @@ static int nrf_mram_erase_and_verify_partial(uint32_t addr, size_t len)
 }
 #endif
 
-#if defined(CONFIG_MRAM_LATENCY) && defined(CONFIG_SOC_SERIES_NRF54H)
+#ifdef CONFIG_NRF_MRAM_CHECK_READY_BIT
 static inline bool nrf_mram_ready(uint32_t addr, uint32_t ironside_se_ver)
 {
-	if (ironside_se_ver < IRONSIDE_SE_SUPPORT_READY_VER) {
-		return true;
-	}
-
 	if (addr < SOC_NRF_MRAM_BANK_11_ADDRESS) {
 		return (bool)NRF_MRAMC110->READY;
 	} else {
@@ -385,10 +507,12 @@ static int nrf_mram_write(const struct device *dev, off_t offset, const void *da
 
 	/* First, write the partial bytes from the first word */
 	if (len_break.first_word_bytes) {
+		nrf_mram_hw_lock(addr);
 		while (!nrf_mram_ready(addr, ironside_se_ver)) {
 			/* Wait until MRAM controller is ready */
 		}
 		ret = nrf_mram_write_and_verify_partial(addr, data, len_break.first_word_bytes);
+		nrf_mram_hw_unlock(addr);
 		if (ret) {
 			goto unlock;
 		}
@@ -399,12 +523,14 @@ static int nrf_mram_write(const struct device *dev, off_t offset, const void *da
 	}
 #endif
 	for (uint32_t i = 0; i < (len / MRAM_WORD_SIZE); i++) {
+		nrf_mram_hw_lock(addr + (i * MRAM_WORD_SIZE));
 		while (!nrf_mram_ready(addr + (i * MRAM_WORD_SIZE), ironside_se_ver)) {
 			/* Wait until MRAM controller is ready */
 		}
 		ret = nrf_mram_write_and_verify_word(
 			addr + (i * MRAM_WORD_SIZE),
 			(void *)((uintptr_t)data + (i * MRAM_WORD_SIZE)), MRAM_WORD_SIZE);
+		nrf_mram_hw_unlock(addr + (i * MRAM_WORD_SIZE));
 		if (ret) {
 			goto latency_release;
 		}
@@ -412,6 +538,7 @@ static int nrf_mram_write(const struct device *dev, off_t offset, const void *da
 
 #if (WRITE_BLOCK_SIZE & MRAM_WORD_MASK)
 	if (len_break.last_word_bytes) {
+		nrf_mram_hw_lock(addr + len_break.aligned_bytes);
 		while (!nrf_mram_ready(addr + len_break.aligned_bytes, ironside_se_ver)) {
 			/* Wait until MRAM controller is ready */
 		}
@@ -419,6 +546,7 @@ static int nrf_mram_write(const struct device *dev, off_t offset, const void *da
 			addr + len_break.aligned_bytes,
 			(void *)((uintptr_t)data + len_break.aligned_bytes),
 			len_break.last_word_bytes);
+		nrf_mram_hw_unlock(addr + len_break.aligned_bytes);
 		if (ret) {
 			goto unlock;
 		}
@@ -435,7 +563,9 @@ latency_release:
 		}
 #endif
 	}
+#if defined(CONFIG_MRAM_LATENCY) || (WRITE_BLOCK_SIZE & MRAM_WORD_MASK)
 unlock:
+#endif
 	k_mutex_unlock(&nrf_mram_data->nrf_mram_mutex);
 	return ret;
 }
@@ -454,7 +584,10 @@ static int nrf_mram_erase(const struct device *dev, off_t offset, size_t size)
 
 	LOG_DBG("erase: %p:%zu", (void *)addr, size);
 
+	uint32_t hw_lock_addr = addr;
+
 	k_mutex_lock(&nrf_mram_data->nrf_mram_mutex, K_FOREVER);
+	nrf_mram_hw_lock(hw_lock_addr);
 
 	/* Ensure that the mramc banks are powered on */
 	if (ironside_se_ver >= IRONSIDE_SE_SUPPORT_READY_VER) {
@@ -520,7 +653,10 @@ latency_release:
 		}
 #endif
 	}
+#if defined(CONFIG_MRAM_LATENCY) || (WRITE_BLOCK_SIZE & MRAM_WORD_MASK)
 unlock:
+#endif
+	nrf_mram_hw_unlock(hw_lock_addr);
 	k_mutex_unlock(&nrf_mram_data->nrf_mram_mutex);
 	return ret;
 }

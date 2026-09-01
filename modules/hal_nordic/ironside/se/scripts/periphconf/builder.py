@@ -41,6 +41,7 @@ SKIP_SPU_PERIPH_PERM_COMPATS = {
     "nordic,nrf-temp",
     "nordic,nrf-vevif-task-tx",
     "nordic,nrf-vevif-task-rx",
+    "nordic,nrf-mutex",
     # No retention in TDD so permissions can't be set outside of the TDD service
     "nordic,coresight-nrf",
     "nordic,nrf-tbm",
